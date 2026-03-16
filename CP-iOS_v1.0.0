@@ -1,0 +1,724 @@
+# Custom Packet iOS v1.0.0
+# Custom Packet TX + RX combo for Pythonista
+# Default Packet is 1200 baud APRS
+# Packet Type can be customized in the code
+# This project is meant to be open sourced, see License 
+# Version v1.0.0 has trouble decoding above 600 bps
+
+import ui, sound, wave, time, math, threading, os
+from datetime import datetime
+from collections import deque
+
+# Optional GPS
+try:
+    import location
+    HAS_LOCATION = True
+except Exception:
+    HAS_LOCATION = False
+
+# =========================
+# SHARED CONFIG
+# =========================
+TARGET_SR = 9600
+
+# AFSK / AX.25
+BAUD = 1200
+MARK = 1200
+SPACE = 2200
+FLAG = 0x7E
+POLY = 0x8408
+
+# NRZI
+NRZI_POLARITY = 0  # 0 standard, 1 invert
+
+# =========================
+# TX CONFIG
+# =========================
+SAMPLE_RATE = 9600
+
+SAMPLES_PER_BIT = SAMPLE_RATE // BAUD  # 40 @ 48k/1200
+
+PREAMBLE_FLAGS = BAUD // 20  # ~400ms flagd
+POSTAMBLE_FLAGS = PREAMBLE_FLAGS // 4 
+# ~100ms offlags
+MARK_LEAD_MS = 400        # MARK lead-in
+TONE_AMPLITUDE = 0.05     # adjust 0.03–0.08
+
+# =========================
+# RX CONFIG
+# =========================
+ROLL_SEC = 15.0
+MAX_RECORD_SECONDS = 20.0
+
+MIN_FLAG_SCORE = 2
+SHOW_ONLY_CRC_OK = False
+
+MAX_LOG_CHARS = 12000
+
+# WAV finalize detection
+STABLE_SECONDS_REQUIRED = 0.5
+CHECK_INTERVAL = 0.2
+MAX_WAIT_SECONDS = 10.0
+
+
+# =========================
+# UI helper
+# =========================
+def run_ui(fn):
+    ui.delay(fn, 0)
+
+
+# =========================
+# AX.25 helpers (shared)
+# =========================
+def encode_callsign(callsign):
+    if '-' in callsign:
+        base, ssid = callsign.split('-')
+        ssid = int(ssid)
+    else:
+        base, ssid = callsign, 0
+    base = base.ljust(6)[:6].upper()
+    encoded = bytearray((ord(c) << 1) for c in base)
+    encoded.append(((ssid & 0x0F) << 1) | 0x60)
+    return encoded
+
+def crc16_x25(data):
+    crc = 0xFFFF
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            crc = (crc >> 1) ^ POLY if (crc & 1) else (crc >> 1)
+    return crc ^ 0xFFFF
+
+def ax25_frame(source, destination, path_list, info_ascii):
+    frame = bytearray()
+    frame.extend(encode_callsign(destination))
+    frame.extend(encode_callsign(source))
+    for call in path_list:
+        frame.extend(encode_callsign(call))
+    frame[-1] |= 0x01                  # end of address field
+    frame.extend(b'\x03\xf0')          # UI frame, no layer 3
+    frame.extend(info_ascii.encode('ascii', 'replace'))
+    fcs = crc16_x25(frame)
+    frame.extend(fcs.to_bytes(2, 'little'))  # over-air order
+    return frame
+
+def bits_lsb(b):
+    return [(b >> i) & 1 for i in range(8)]
+
+def bits_to_bytes(bits):
+    out = bytearray()
+    v = 0
+    k = 0
+    for b in bits:
+        v |= (b & 1) << k
+        k += 1
+        if k == 8:
+            out.append(v)
+            v = 0
+            k = 0
+    return out
+
+def destuff(bits):
+    out = []
+    ones = 0
+    i = 0
+    while i < len(bits):
+        b = bits[i]
+        out.append(b)
+        if b == 1:
+            ones += 1
+            if ones == 5:
+                # Skip the stuffed 0 if present
+                if i + 1 < len(bits) and bits[i+1] == 0:
+                    i += 1
+                ones = 0
+        else:
+            ones = 0
+        i += 1
+    return out
+
+def parse_ax25(frame):
+    if frame is None or len(frame) < 18:
+        return None
+
+    def dec(addr7):
+        call = ''.join(chr((c >> 1) & 0x7F) for c in addr7[:6]).rstrip()
+        ssid = (addr7[6] >> 1) & 0x0F
+        return f"{call}-{ssid}" if ssid else call
+
+    i = 0
+    addrs = []
+    while True:
+        if i + 7 > len(frame):
+            return None
+        addr = frame[i:i+7]
+        addrs.append(dec(addr))
+        i += 7
+        if addr[6] & 1:
+            break
+        if len(addrs) > 10:
+            return None
+
+    if i + 2 + 2 > len(frame):
+        return None
+
+    info = frame[i+2:-2]
+    fcs_rx = int.from_bytes(frame[-2:], 'little')
+    ok = (crc16_x25(frame[:-2]) == fcs_rx)
+    return addrs, info, ok
+
+
+# =========================
+# TX (AFSK1200 encode)
+# =========================
+def _byte_bits_lsb_first(b):
+    return [(b >> i) & 1 for i in range(8)]
+
+def _bit_stuff(bits):
+    out, ones = [], 0
+    for bit in bits:
+        out.append(bit)
+        if bit == 1:
+            ones += 1
+            if ones == 5:
+                out.append(0)
+                ones = 0
+        else:
+            ones = 0
+    return out
+
+def generate_bitstream(frame_bytes):
+    flag_bits = _byte_bits_lsb_first(FLAG)
+
+    frame_bits = []
+    for b in frame_bytes:
+        frame_bits.extend(_byte_bits_lsb_first(b))
+    stuffed = _bit_stuff(frame_bits)
+
+    # preamble flags + stuffed frame + postamble flags
+    bits = (flag_bits * PREAMBLE_FLAGS) + stuffed + (flag_bits * POSTAMBLE_FLAGS)
+
+    # NRZI: 0 => transition, 1 => no transition
+    nrzi = []
+    state = 1
+    for bit in bits:
+        effective_bit = bit ^ NRZI_POLARITY
+        if effective_bit == 0:
+            state ^= 1
+        nrzi.append(state)
+    return nrzi
+
+def generate_continuous_tone(freq, samples, phase=0.0, amp=TONE_AMPLITUDE):
+    out = []
+    w = 2 * math.pi * freq / SAMPLE_RATE
+    for n in range(samples):
+        out.append(int(amp * 32767 * math.sin(phase + n * w)))
+    phase = (phase + samples * w) % (2 * math.pi)
+    return out, phase
+
+def afsk_encode(frame_bytes):
+    audio = []
+    phase = 0.0
+
+    # MARK lead-in
+    lead_samples = int(MARK_LEAD_MS * SAMPLE_RATE / 1000)
+    lead, phase = generate_continuous_tone(MARK, lead_samples, phase)
+    audio.extend(lead)
+
+    # NRZI states -> tones
+    nrzi_states = generate_bitstream(frame_bytes)
+    for state in nrzi_states:
+        tone_freq = MARK if state == 1 else SPACE
+        chunk, phase = generate_continuous_tone(tone_freq, SAMPLES_PER_BIT, phase)
+        audio.extend(chunk)
+
+    # Normalize gently
+    peak = max(1, max(abs(s) for s in audio))
+    scale = int(30000 / peak)
+    return [int(s * scale) for s in audio]
+
+def save_to_wav(audio, filename):
+    with wave.open(filename, 'w') as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(SAMPLE_RATE)
+        wav_data = bytearray()
+        for s in audio:
+            wav_data.extend(int(s).to_bytes(2, 'little', signed=True))
+        f.writeframes(wav_data)
+
+def play_audio(filename):
+    sound.play_effect(filename)
+
+def get_current_coordinates():
+    if not HAS_LOCATION:
+        raise RuntimeError("location module not available")
+    location.start_updates()
+    time.sleep(0.25)
+    loc = location.get_location()
+    location.stop_updates()
+    return loc['latitude'], loc['longitude']
+
+def format_coordinates(lat, lon, table='/', symbol='-'):
+    lat_deg = int(abs(lat));   lat_min = (abs(lat) - lat_deg) * 60
+    lon_deg = int(abs(lon));   lon_min = (abs(lon) - lon_deg) * 60
+    lat_hem = 'N' if lat >= 0 else 'S'
+    lon_hem = 'E' if lon >= 0 else 'W'
+    lat_str = f"{lat_deg:02}{lat_min:05.2f}{lat_hem}"
+    lon_str = f"{lon_deg:03}{lon_min:05.2f}{lon_hem}"
+    return f"{lat_str}{table}{lon_str}{symbol}"
+
+
+# =========================
+# RX DSP helpers
+# =========================
+def resample_linear(x, src_sr, dst_sr):
+    if src_sr == dst_sr or len(x) < 2:
+        return x
+    ratio = dst_sr / float(src_sr)
+    n_out = int(len(x) * ratio)
+    out = [0.0] * n_out
+    for i in range(n_out):
+        t = i / ratio
+        j = int(t)
+        f = t - j
+        if j >= len(x) - 1:
+            out[i] = x[-1]
+        else:
+            out[i] = x[j]*(1-f) + x[j+1]*f
+    return out
+
+def dc_block(x, r=0.995):
+    y = []
+    px = py = 0.0
+    for s in x:
+        yn = s - px + r*py
+        y.append(yn)
+        px, py = s, yn
+    return y
+
+def goertzel(samples, sr, freq):
+    if not samples:
+        return 0.0
+    w = 2*math.pi*freq/sr
+    c = 2*math.cos(w)
+    s0 = s1 = 0.0
+    for x in samples:
+        s = x + c*s0 - s1
+        s1, s0 = s0, s
+    return s0*s0 + s1*s1 - c*s0*s1
+
+
+class AFSKDecoder:
+    def __init__(self):
+        self.buf = deque(maxlen=int(ROLL_SEC * TARGET_SR))
+
+    def push(self, samples, sr):
+        x = dc_block(samples)
+        x = resample_linear(x, sr, TARGET_SR)
+        self.buf.extend(x)
+
+    def decode(self):
+        samples = list(self.buf)
+        spb = TARGET_SR // BAUD
+        if len(samples) < spb * 80:
+            return []
+
+        flag_bits = bits_lsb(FLAG)
+        best_bits = None
+        best_score = -1
+
+        for off in range(spb):
+            states = []
+            i = off
+            while i + spb <= len(samples):
+                win = samples[i:i+spb]
+                pm = goertzel(win, TARGET_SR, MARK)
+                ps = goertzel(win, TARGET_SR, SPACE)
+                states.append(1 if pm >= ps else 0)
+                i += spb
+
+            if len(states) < 3:
+                continue
+
+            bits = []
+            prev = states[0]
+            for s in states[1:]:
+                transition = (s != prev)
+                bit = 0 if transition else 1
+                bit ^= NRZI_POLARITY
+                bits.append(bit)
+                prev = s
+
+            if len(bits) < 80:
+                continue
+
+            score = 0
+            for j in range(0, len(bits) - 8):
+                if bits[j:j+8] == flag_bits:
+                    score += 1
+
+            if score > best_score:
+                best_score = score
+                best_bits = bits
+
+        if best_bits is None or best_score < MIN_FLAG_SCORE:
+            return []
+
+        pos = [j for j in range(0, len(best_bits) - 8)
+               if best_bits[j:j+8] == flag_bits]
+        if len(pos) > 300:
+            pos = pos[:300]
+
+        frames = []
+        for a, b in zip(pos, pos[1:]):
+            payload = best_bits[a+8:b]
+            if len(payload) < 8 * 18:
+                continue
+            frame = bits_to_bytes(destuff(payload))
+            pkt = parse_ax25(frame)
+            if pkt:
+                frames.append(pkt)
+        return frames
+
+
+# =========================
+# WAV helpers for RX
+# =========================
+def wav_stream_read(fn, seconds_per_block=1.0):
+    with wave.open(fn, 'rb') as w:
+        sr = w.getframerate()
+        ch = w.getnchannels()
+        sw = w.getsampwidth()
+        if sw != 2:
+            raise ValueError("Expected 16-bit WAV")
+
+        frames_per_block = max(256, int(sr * seconds_per_block))
+        while True:
+            raw = w.readframes(frames_per_block)
+            if not raw:
+                break
+            samples = []
+            step = 2 * ch
+            for i in range(0, len(raw), step):
+                s = int.from_bytes(raw[i:i+2], 'little', signed=True)
+                samples.append(s / 32768.0)
+            yield samples, sr
+
+def wait_for_file_stable(fn):
+    deadline = time.time() + MAX_WAIT_SECONDS
+    last_size = -1
+    stable_for = 0.0
+    while time.time() < deadline:
+        if not os.path.exists(fn):
+            time.sleep(CHECK_INTERVAL)
+            continue
+        sz = os.path.getsize(fn)
+        if sz == last_size and sz > 44:
+            stable_for += CHECK_INTERVAL
+            if stable_for >= STABLE_SECONDS_REQUIRED:
+                return True
+        else:
+            stable_for = 0.0
+            last_size = sz
+        time.sleep(CHECK_INTERVAL)
+    return False
+
+
+# =========================
+# TX View
+# =========================
+class TXView(ui.View):
+    def __init__(self):
+        super().__init__()
+        self.bg_color = '#101214'
+
+        self.title = ui.Label(text="APRS AFSK TX", text_color='white', font=('Helvetica-Bold', 20))
+        self.add_subview(self.title)
+
+        self.src = ui.TextField(text='N0CALL-1', placeholder='Source (MYCALL-SSID)',
+                                autocorrection_type=False, spellchecking_type=False,
+                                text_color='black', bg_color='#1c1f24')
+        self.dest = ui.TextField(text='APRS', placeholder='Destination',
+                                 autocorrection_type=False, spellchecking_type=False,
+                                 text_color='black', bg_color='#1c1f24')
+        self.path = ui.TextField(text='WIDE1-1,WIDE2-1', placeholder='Path CSV',
+                                 autocorrection_type=False, spellchecking_type=False,
+                                 text_color='black', bg_color='#1c1f24')
+        self.comment = ui.TextField(text='Pythonista', placeholder='Comment',
+                                    autocorrection_type=True, spellchecking_type=True,
+                                    text_color='black', bg_color='#1c1f24')
+
+        for w in (self.src, self.dest, self.path, self.comment):
+            w.border_width = 0
+            w.corner_radius = 8
+            w.font = ('Menlo', 14)
+            self.add_subview(w)
+
+        self.use_gps = ui.Switch(value=HAS_LOCATION)
+        self.gps_label = ui.Label(text=f"Use GPS ({'available' if HAS_LOCATION else 'no location module'})",
+                                  text_color='black', font=('Menlo', 12))
+        self.add_subview(self.use_gps)
+        self.add_subview(self.gps_label)
+
+        self.manual_lat = ui.TextField(text='37.0000', placeholder='Manual lat',
+                                       autocorrection_type=False, spellchecking_type=False,
+                                       text_color='black', bg_color='#1c1f24')
+        self.manual_lon = ui.TextField(text='-122.0000', placeholder='Manual lon',
+                                       autocorrection_type=False, spellchecking_type=False,
+                                       text_color='black', bg_color='#1c1f24')
+        for w in (self.manual_lat, self.manual_lon):
+            w.border_width = 0
+            w.corner_radius = 8
+            w.font = ('Menlo', 14)
+            self.add_subview(w)
+
+        self.play_btn = ui.Button(title="Generate + Play", font=('Helvetica-Bold', 18))
+        self.play_btn.action = self.on_play
+        self.play_btn.bg_color = '#2b6cff'
+        self.play_btn.tint_color = 'white'
+        self.play_btn.corner_radius = 10
+        self.add_subview(self.play_btn)
+
+        self.status = ui.Label(text="Idle", text_color='white', font=('Menlo', 12))
+        self.add_subview(self.status)
+
+        self.last_info = ui.TextView(editable=False, font=('Menlo', 12))
+        self.last_info.text_color = 'lime'
+        self.last_info.bg_color = '#0b0d10'
+        self.last_info.corner_radius = 10
+        self.add_subview(self.last_info)
+
+    def layout(self):
+        pad = 12
+        y = 10
+        self.title.frame = (pad, y, self.width - 2*pad, 28); y += 36
+
+        w = self.width - 2*pad
+        h = 34
+        self.src.frame = (pad, y, w, h); y += h + 8
+        self.dest.frame = (pad, y, w, h); y += h + 8
+        self.path.frame = (pad, y, w, h); y += h + 8
+        self.comment.frame = (pad, y, w, h); y += h + 10
+
+        self.use_gps.frame = (pad, y, 60, 32)
+        self.gps_label.frame = (pad + 70, y+5, w - 70, 24)
+        y += 40
+
+        half = (w - 8) / 2
+        self.manual_lat.frame = (pad, y, half, h)
+        self.manual_lon.frame = (pad + half + 8, y, half, h)
+        y += h + 12
+
+        self.play_btn.frame = (pad, y, w, 44); y += 52
+        self.status.frame = (pad, y, w, 20); y += 28
+        self.last_info.frame = (pad, y, w, self.height - y - pad)
+
+    def set_status(self, s):
+        self.status.text = s
+
+    def on_play(self, sender):
+        try:
+            src = self.src.text.strip() or 'N0CALL-1'
+            dest = self.dest.text.strip() or 'APRS'
+            path = [p.strip() for p in (self.path.text or '').split(',') if p.strip()]
+            comment = (self.comment.text or 'Pythonista').strip()
+
+            if self.use_gps.value and HAS_LOCATION:
+                self.set_status("Getting GPS...")
+                lat, lon = get_current_coordinates()
+            else:
+                lat = float(self.manual_lat.text.strip())
+                lon = float(self.manual_lon.text.strip())
+
+            position = format_coordinates(lat, lon, '/', '-')
+            tz = datetime.utcnow().strftime("%d%H%Mz")
+            info = f"@{tz}{position}{comment}"
+
+            frame = ax25_frame(src, dest, path, info)
+            audio = afsk_encode(frame)
+
+            fn = f"aprs_{datetime.now().strftime('%H%M%S')}.wav"
+            save_to_wav(audio, fn)
+            play_audio(fn)
+
+            self.last_info.text = (
+                f"Built info:\n{info}\n\n"
+                f"Frame bytes: {len(frame)}\n"
+                f"WAV: {fn}\n"
+                f"(Played via sound.play_effect)\n"
+            )
+            self.set_status("Played.")
+        except Exception as e:
+            self.set_status(f"Error: {e!r}")
+
+
+# =========================
+# RX View
+# =========================
+class RXView(ui.View):
+    def __init__(self):
+        super().__init__()
+        self.bg_color = 'black'
+
+        self.title = ui.Label(text="Custom Packet RX", text_color='white', font=('Helvetica-Bold', 20))
+        self.add_subview(self.title)
+
+        self.start_btn = ui.Button(title="Start RX", action=self.start_rx, font=('Helvetica', 20))
+        self.stop_btn  = ui.Button(title="Stop + Decode", action=self.stop_rx, font=('Helvetica', 20))
+        self.stop_btn.enabled = False
+
+        self.start_btn.bg_color = '#2b6cff'
+        self.start_btn.tint_color = 'white'
+        self.start_btn.corner_radius = 10
+
+        self.stop_btn.bg_color = '#ff3b30'
+        self.stop_btn.tint_color = 'white'
+        self.stop_btn.corner_radius = 10
+
+        self.add_subview(self.start_btn)
+        self.add_subview(self.stop_btn)
+
+        self.status = ui.Label(text="Idle", text_color='white', font=('Menlo', 12))
+        self.add_subview(self.status)
+
+        self.out = ui.TextView(font=('Menlo', 12), editable=False)
+        self.out.text_color = 'lime'
+        self.out.bg_color = 'black'
+        self.add_subview(self.out)
+
+        self._rec = None
+        self._fn = None
+        self._decoding = False
+
+    def layout(self):
+        pad = 12
+        y = 10
+        self.title.frame = (pad, y, self.width - 2*pad, 28); y += 38
+
+        w = self.width - 2*pad
+        self.start_btn.frame = (pad, y, (w-10)/2, 44)
+        self.stop_btn.frame  = (pad + (w-10)/2 + 10, y, (w-10)/2, 44)
+        y += 54
+
+        self.status.frame = (pad, y, w, 20); y += 28
+        self.out.frame = (pad, y, w, self.height - y - pad)
+
+    def set_status(self, s):
+        run_ui(lambda: setattr(self.status, 'text', s))
+
+    def log_lines(self, lines):
+        def _do():
+            t = self.out.text + "\n".join(lines) + "\n"
+            if len(t) > MAX_LOG_CHARS:
+                t = t[-MAX_LOG_CHARS:]
+            self.out.text = t
+            self.out.content_offset = (0, max(0, self.out.content_size[1] - self.out.height))
+        run_ui(_do)
+
+    def start_rx(self, sender):
+        if self._rec or self._decoding:
+            return
+        self.out.text = ""
+        self._fn = f"_rx_{int(time.time())}.wav"
+        self._rec = sound.Recorder(self._fn)
+        try:
+            self._rec.record(MAX_RECORD_SECONDS)
+        except Exception:
+            self._rec.record()
+        self.start_btn.enabled = False
+        self.stop_btn.enabled = True
+        self.set_status("Recording...")
+
+    def stop_rx(self, sender):
+        if not self._rec or self._decoding:
+            return
+        try:
+            self._rec.stop()
+        except Exception:
+            pass
+        self._rec = None
+        self.stop_btn.enabled = False
+        self.set_status("Finalizing WAV...")
+        self._decoding = True
+        threading.Thread(target=self._decode_worker, args=(self._fn,), daemon=True).start()
+
+    def _decode_worker(self, fn):
+        lines = []
+        try:
+            if not wait_for_file_stable(fn):
+                lines.append("[warn] WAV not stable")
+                return
+
+            dec = AFSKDecoder()
+
+            # Read entire file
+            for block, sr in wav_stream_read(fn):
+                dec.push(block, sr)
+
+            # Decode once
+            pkts = dec.decode()
+
+            for addrs, info, ok in pkts:
+                if SHOW_ONLY_CRC_OK and not ok:
+                    continue
+                dest = addrs[0]
+                src  = addrs[1]
+                path = ",".join(addrs[2:]) if len(addrs) > 2 else "-"
+                lines.append(f"{src} > {dest} via {path} CRC:{'OK' if ok else 'BAD'}")
+                lines.append(info.decode('ascii', 'replace'))
+                lines.append("")
+
+            if not lines:
+                lines.append("[decode] no CRC-OK frames")
+
+        except Exception as e:
+            lines.append(f"[decode error] {e!r}")
+        finally:
+            try:
+                os.remove(fn)
+            except Exception:
+                pass
+            self.log_lines(lines)
+            run_ui(lambda: self.set_status("Done."))
+            run_ui(lambda: setattr(self.start_btn, 'enabled', True))
+            self._decoding = False
+
+
+# =========================
+# App container (tab switch)
+# =========================
+class App(ui.View):
+    def __init__(self):
+        super().__init__()
+        self.name = "APRS TX/RX"
+        self.bg_color = '#0b0d10'
+
+        self.seg = ui.SegmentedControl(segments=['TX', 'RX'])
+        self.seg.selected_index = 0
+        self.seg.action = self.on_tab
+        self.add_subview(self.seg)
+
+        self.tx = TXView()
+        self.rx = RXView()
+        self.add_subview(self.tx)
+        self.add_subview(self.rx)
+
+        self.on_tab(self.seg)
+
+    def layout(self):
+        pad = 10
+        self.seg.frame = (pad, pad, self.width - 2*pad, 32)
+        content_y = pad + 40
+        content_h = self.height - content_y - pad
+        for v in (self.tx, self.rx):
+            v.frame = (0, content_y, self.width, content_h)
+
+    def on_tab(self, sender):
+        i = self.seg.selected_index
+        self.tx.hidden = (i != 0)
+        self.rx.hidden = (i != 1)
+
+
+App().present('fullscreen')
