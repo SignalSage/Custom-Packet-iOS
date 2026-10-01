@@ -1,0 +1,3172 @@
+# Custom Packet iOS v1.1.0
+# Custom Packet TX/RX for Pythonista
+# Default is 1200 bps but configurable
+# This project is open sourced. See License.
+# Direct internal loopback test acailabme
+# RX records audio first, then decodes after Stop.
+
+import ui
+import sound
+import wave
+import time
+import math
+import threading
+import os
+
+from datetime import datetime
+from collections import deque
+
+
+# =========================
+# Optional GPS
+# =========================
+
+try:
+    import location
+    HAS_LOCATION = True
+except Exception:
+    HAS_LOCATION = False
+
+
+# =========================
+# GLOBAL CONFIG
+# =========================
+
+TARGET_SR = 19200
+TX_SAMPLE_RATE = 19200
+
+FLAG = 0x7E
+POLY = 0x8408
+
+NRZI_POLARITY = 0
+
+MAX_RECORD_SECONDS = 60.0
+FINALIZE_WAIT_SEC = 3.0
+
+SHOW_ONLY_CRC_OK = False
+MAX_LOG_CHARS = 16000
+
+TX_MARK_LEAD_MS = 0
+TX_TONE_AMPLITUDE = 0.10
+
+
+# =========================
+# UI helpers
+# =========================
+
+def run_ui(fn):
+    ui.delay(fn, 0)
+
+
+def clamp(value, minimum, maximum):
+    if value < minimum:
+        return minimum
+
+    if value > maximum:
+        return maximum
+
+    return value
+
+
+def safe_int(value, default):
+    try:
+        return int(str(value).strip())
+    except Exception:
+        return default
+
+
+def safe_float(value, default):
+    try:
+        return float(str(value).strip())
+    except Exception:
+        return default
+
+
+# =========================
+# AX.25 helpers
+# =========================
+
+def encode_callsign(callsign):
+    callsign = str(callsign).strip().upper()
+
+    if '-' in callsign:
+        base, ssid_text = callsign.split('-', 1)
+
+        try:
+            ssid = int(ssid_text)
+        except Exception:
+            ssid = 0
+    else:
+        base = callsign
+        ssid = 0
+
+    base = base.ljust(6)[:6]
+
+    encoded = bytearray(
+        (ord(character) << 1)
+        for character in base
+    )
+
+    encoded.append(
+        ((ssid & 0x0F) << 1) | 0x60
+    )
+
+    return encoded
+
+
+def crc16_x25(data):
+    crc = 0xFFFF
+
+    for byte in data:
+        crc ^= byte
+
+        for _ in range(8):
+            if crc & 1:
+                crc = (crc >> 1) ^ POLY
+            else:
+                crc >>= 1
+
+    return crc ^ 0xFFFF
+
+
+def ax25_frame(source, destination, path_list, info_ascii):
+    frame = bytearray()
+
+    frame.extend(
+        encode_callsign(destination)
+    )
+
+    frame.extend(
+        encode_callsign(source)
+    )
+
+    for callsign in path_list:
+        frame.extend(
+            encode_callsign(callsign)
+        )
+
+    # Set the extension bit on the final address.
+    frame[-1] |= 0x01
+
+    # UI frame control and no-layer-3 protocol ID.
+    frame.extend(b'\x03\xf0')
+
+    frame.extend(
+        info_ascii.encode(
+            'ascii',
+            'replace'
+        )
+    )
+
+    fcs = crc16_x25(frame)
+
+    frame.extend(
+        fcs.to_bytes(
+            2,
+            'little'
+        )
+    )
+
+    return frame
+
+
+def bits_lsb(byte):
+    return [
+        (byte >> bit_number) & 1
+        for bit_number in range(8)
+    ]
+
+
+def bits_to_bytes(bits):
+    output = bytearray()
+
+    value = 0
+    bit_count = 0
+
+    for bit in bits:
+        value |= (
+            (bit & 1) << bit_count
+        )
+
+        bit_count += 1
+
+        if bit_count == 8:
+            output.append(value)
+
+            value = 0
+            bit_count = 0
+
+    return output
+
+
+def parse_ax25(frame):
+    if frame is None or len(frame) < 18:
+        return None
+
+    def decode_address(address):
+        callsign = ''.join(
+            chr((value >> 1) & 0x7F)
+            for value in address[:6]
+        ).rstrip()
+
+        ssid = (
+            address[6] >> 1
+        ) & 0x0F
+
+        if ssid:
+            return '{}-{}'.format(
+                callsign,
+                ssid
+            )
+
+        return callsign
+
+    index = 0
+    addresses = []
+
+    while True:
+        if index + 7 > len(frame):
+            return None
+
+        address = frame[
+            index:index + 7
+        ]
+
+        addresses.append(
+            decode_address(address)
+        )
+
+        index += 7
+
+        if address[6] & 0x01:
+            break
+
+        if len(addresses) > 10:
+            return None
+
+    # Need control, PID, and FCS.
+    if index + 4 > len(frame):
+        return None
+
+    info = frame[index + 2:-2]
+
+    received_fcs = int.from_bytes(
+        frame[-2:],
+        'little'
+    )
+
+    calculated_fcs = crc16_x25(
+        frame[:-2]
+    )
+
+    crc_ok = (
+        received_fcs == calculated_fcs
+    )
+
+    return addresses, info, crc_ok
+
+
+def is_printable_payload(info_bytes):
+    try:
+        text = info_bytes.decode(
+            'ascii',
+            'replace'
+        )
+    except Exception:
+        return False
+
+    bad_characters = 0
+
+    for character in text:
+        value = ord(character)
+
+        if (
+            value < 32
+            and character not in '\r\n\t'
+        ):
+            bad_characters += 1
+
+    allowable_bad = max(
+        2,
+        len(text) // 10
+    )
+
+    return bad_characters <= allowable_bad
+
+
+# =========================
+# TX helpers
+# =========================
+
+def _byte_bits_lsb_first(byte):
+    return [
+        (byte >> index) & 1
+        for index in range(8)
+    ]
+
+
+def _bit_stuff(bits):
+    output = []
+    consecutive_ones = 0
+
+    for bit in bits:
+        output.append(bit)
+
+        if bit == 1:
+            consecutive_ones += 1
+
+            if consecutive_ones == 5:
+                output.append(0)
+                consecutive_ones = 0
+        else:
+            consecutive_ones = 0
+
+    return output
+
+
+def generate_bitstream(
+    frame_bytes,
+    preamble_flags,
+    postamble_flags,
+    nrzi_polarity=0
+):
+    flag_bits = _byte_bits_lsb_first(
+        FLAG
+    )
+
+    frame_bits = []
+
+    for byte in frame_bytes:
+        frame_bits.extend(
+            _byte_bits_lsb_first(byte)
+        )
+
+    stuffed_bits = _bit_stuff(
+        frame_bits
+    )
+
+    bits = (
+        flag_bits * preamble_flags
+        + stuffed_bits
+        + flag_bits * postamble_flags
+    )
+
+    nrzi_states = []
+
+    state = 1
+
+    for bit in bits:
+        effective_bit = (
+            bit ^ nrzi_polarity
+        )
+
+        # NRZI zero causes a transition.
+        if effective_bit == 0:
+            state ^= 1
+
+        nrzi_states.append(state)
+
+    return nrzi_states
+
+
+def generate_continuous_tone(
+    frequency,
+    sample_count,
+    sample_rate,
+    phase=0.0,
+    amplitude=TX_TONE_AMPLITUDE
+):
+    output = []
+
+    angular_step = (
+        2.0
+        * math.pi
+        * frequency
+        / float(sample_rate)
+    )
+
+    for index in range(sample_count):
+        value = (
+            amplitude
+            * 32767.0
+            * math.sin(
+                phase
+                + index * angular_step
+            )
+        )
+
+        output.append(
+            int(value)
+        )
+
+    phase = (
+        phase
+        + sample_count * angular_step
+    ) % (2.0 * math.pi)
+
+    return output, phase
+
+
+def afsk_encode(
+    frame_bytes,
+    baud,
+    mark,
+    space,
+    sample_rate=TX_SAMPLE_RATE,
+    preamble_ms=400.0,
+    postamble_ms=100.0,
+    mark_lead_ms=TX_MARK_LEAD_MS,
+    nrzi_polarity=0
+):
+    baud = max(
+        1,
+        min(
+            int(baud),
+            9600
+        )
+    )
+
+    preamble_flags = max(
+        2,
+        int(
+            round(
+                (preamble_ms / 1000.0)
+                * baud
+                / 8.0
+            )
+        )
+    )
+
+    postamble_flags = max(
+        1,
+        int(
+            round(
+                (postamble_ms / 1000.0)
+                * baud
+                / 8.0
+            )
+        )
+    )
+
+    audio = []
+    phase = 0.0
+
+    lead_samples = int(
+        round(
+            mark_lead_ms
+            * sample_rate
+            / 1000.0
+        )
+    )
+
+    lead_audio, phase = generate_continuous_tone(
+        mark,
+        lead_samples,
+        sample_rate,
+        phase
+    )
+
+    audio.extend(lead_audio)
+
+    nrzi_states = generate_bitstream(
+        frame_bytes,
+        preamble_flags,
+        postamble_flags,
+        nrzi_polarity
+    )
+
+    sample_position = 0.0
+
+    samples_per_bit = (
+        sample_rate
+        / float(baud)
+    )
+
+    for state in nrzi_states:
+        next_position = (
+            sample_position
+            + samples_per_bit
+        )
+
+        start_index = int(
+            round(sample_position)
+        )
+
+        end_index = int(
+            round(next_position)
+        )
+
+        sample_count = max(
+            1,
+            end_index - start_index
+        )
+
+        tone_frequency = (
+            mark
+            if state == 1
+            else space
+        )
+
+        chunk, phase = generate_continuous_tone(
+            tone_frequency,
+            sample_count,
+            sample_rate,
+            phase
+        )
+
+        audio.extend(chunk)
+
+        sample_position = next_position
+
+    if not audio:
+        return []
+
+    peak = max(
+        1,
+        max(
+            abs(sample)
+            for sample in audio
+        )
+    )
+
+    scale = 30000.0 / peak
+
+    return [
+        int(
+            clamp(
+                sample * scale,
+                -32767,
+                32767
+            )
+        )
+        for sample in audio
+    ]
+
+
+def save_to_wav(
+    audio,
+    filename,
+    sample_rate=TX_SAMPLE_RATE
+):
+    with wave.open(filename, 'w') as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+
+        wav_data = bytearray()
+
+        for sample in audio:
+            wav_data.extend(
+                int(sample).to_bytes(
+                    2,
+                    'little',
+                    signed=True
+                )
+            )
+
+        wav_file.writeframes(wav_data)
+
+
+def play_audio(filename):
+    sound.play_effect(filename)
+
+
+def get_current_coordinates():
+    if not HAS_LOCATION:
+        raise RuntimeError(
+            'location module not available'
+        )
+
+    location.start_updates()
+
+    time.sleep(0.25)
+
+    location_data = (
+        location.get_location()
+    )
+
+    location.stop_updates()
+
+    if not location_data:
+        raise RuntimeError(
+            'No GPS location returned'
+        )
+
+    return (
+        location_data['latitude'],
+        location_data['longitude']
+    )
+
+
+def format_coordinates(
+    latitude,
+    longitude,
+    table='/',
+    symbol='-'
+):
+    latitude_degrees = int(
+        abs(latitude)
+    )
+
+    latitude_minutes = (
+        abs(latitude)
+        - latitude_degrees
+    ) * 60.0
+
+    longitude_degrees = int(
+        abs(longitude)
+    )
+
+    longitude_minutes = (
+        abs(longitude)
+        - longitude_degrees
+    ) * 60.0
+
+    latitude_hemisphere = (
+        'N'
+        if latitude >= 0
+        else 'S'
+    )
+
+    longitude_hemisphere = (
+        'E'
+        if longitude >= 0
+        else 'W'
+    )
+
+    latitude_text = (
+        f'{latitude_degrees:02}'
+        f'{latitude_minutes:05.2f}'
+        f'{latitude_hemisphere}'
+    )
+
+    longitude_text = (
+        f'{longitude_degrees:03}'
+        f'{longitude_minutes:05.2f}'
+        f'{longitude_hemisphere}'
+    )
+
+    return (
+        latitude_text
+        + table
+        + longitude_text
+        + symbol
+    )
+
+
+# =========================
+# Basic RX DSP helpers
+# =========================
+
+def resample_linear(
+    samples,
+    source_sample_rate,
+    destination_sample_rate
+):
+    if not samples:
+        return []
+
+    if (
+        source_sample_rate
+        == destination_sample_rate
+        or len(samples) < 2
+    ):
+        return list(samples)
+
+    ratio = (
+        float(destination_sample_rate)
+        / float(source_sample_rate)
+    )
+
+    output_length = max(
+        1,
+        int(
+            round(
+                len(samples) * ratio
+            )
+        )
+    )
+
+    output = [0.0] * output_length
+
+    for output_index in range(
+        output_length
+    ):
+        source_position = (
+            output_index / ratio
+        )
+
+        source_index = int(
+            source_position
+        )
+
+        fraction = (
+            source_position
+            - source_index
+        )
+
+        if source_index >= len(samples) - 1:
+            output[output_index] = (
+                samples[-1]
+            )
+        else:
+            output[output_index] = (
+                samples[source_index]
+                * (1.0 - fraction)
+                + samples[source_index + 1]
+                * fraction
+            )
+
+    return output
+
+
+def dc_block(samples, coefficient=0.995):
+    if not samples:
+        return []
+
+    output = [0.0] * len(samples)
+
+    previous_input = 0.0
+    previous_output = 0.0
+
+    for index, sample in enumerate(samples):
+        value = (
+            sample
+            - previous_input
+            + coefficient * previous_output
+        )
+
+        output[index] = value
+
+        previous_input = sample
+        previous_output = value
+
+    return output
+
+
+def rms_normalize(samples, target=0.30):
+    if not samples:
+        return []
+
+    power = (
+        sum(
+            sample * sample
+            for sample in samples
+        )
+        / float(len(samples))
+    )
+
+    if power <= 1e-12:
+        return list(samples)
+
+    rms = math.sqrt(power)
+    scale = target / rms
+
+    return [
+        clamp(
+            sample * scale,
+            -1.5,
+            1.5
+        )
+        for sample in samples
+    ]
+
+
+def soft_limit(samples, gain=1.35):
+    if not samples:
+        return []
+
+    return [
+        math.tanh(
+            gain * sample
+        )
+        for sample in samples
+    ]
+
+
+# =========================
+# AFSK discriminator DSP
+# =========================
+
+def _interp(samples, position):
+    if not samples:
+        return 0.0
+
+    if position <= 0:
+        return samples[0]
+
+    index = int(position)
+
+    if index >= len(samples) - 1:
+        return samples[-1]
+
+    fraction = position - index
+
+    return (
+        samples[index]
+        * (1.0 - fraction)
+        + samples[index + 1]
+        * fraction
+    )
+
+
+def quadrature_discriminator(
+    samples,
+    sample_rate,
+    mark,
+    space,
+    window_samples
+):
+    sample_count = len(samples)
+
+    if sample_count < window_samples + 2:
+        return []
+
+    window_samples = max(
+        2,
+        int(window_samples)
+    )
+
+    mark_cos_values = (
+        [0.0] * window_samples
+    )
+
+    mark_sin_values = (
+        [0.0] * window_samples
+    )
+
+    space_cos_values = (
+        [0.0] * window_samples
+    )
+
+    space_sin_values = (
+        [0.0] * window_samples
+    )
+
+    mark_cos_sum = 0.0
+    mark_sin_sum = 0.0
+    space_cos_sum = 0.0
+    space_sin_sum = 0.0
+
+    mark_phase = 0.0
+    space_phase = 0.0
+
+    mark_step = (
+        2.0
+        * math.pi
+        * mark
+        / float(sample_rate)
+    )
+
+    space_step = (
+        2.0
+        * math.pi
+        * space
+        / float(sample_rate)
+    )
+
+    output = [0.0] * sample_count
+
+    epsilon = 1e-12
+    two_pi = 2.0 * math.pi
+
+    for index, sample in enumerate(samples):
+        slot = index % window_samples
+
+        mark_cos_sum -= (
+            mark_cos_values[slot]
+        )
+
+        mark_sin_sum -= (
+            mark_sin_values[slot]
+        )
+
+        space_cos_sum -= (
+            space_cos_values[slot]
+        )
+
+        space_sin_sum -= (
+            space_sin_values[slot]
+        )
+
+        mark_cos_value = (
+            sample
+            * math.cos(mark_phase)
+        )
+
+        mark_sin_value = (
+            sample
+            * math.sin(mark_phase)
+        )
+
+        space_cos_value = (
+            sample
+            * math.cos(space_phase)
+        )
+
+        space_sin_value = (
+            sample
+            * math.sin(space_phase)
+        )
+
+        mark_cos_values[slot] = (
+            mark_cos_value
+        )
+
+        mark_sin_values[slot] = (
+            mark_sin_value
+        )
+
+        space_cos_values[slot] = (
+            space_cos_value
+        )
+
+        space_sin_values[slot] = (
+            space_sin_value
+        )
+
+        mark_cos_sum += mark_cos_value
+        mark_sin_sum += mark_sin_value
+
+        space_cos_sum += space_cos_value
+        space_sin_sum += space_sin_value
+
+        mark_phase += mark_step
+        space_phase += space_step
+
+        if mark_phase >= two_pi:
+            mark_phase -= two_pi
+
+        if space_phase >= two_pi:
+            space_phase -= two_pi
+
+        if index >= window_samples - 1:
+            mark_power = (
+                mark_cos_sum * mark_cos_sum
+                + mark_sin_sum * mark_sin_sum
+            )
+
+            space_power = (
+                space_cos_sum * space_cos_sum
+                + space_sin_sum * space_sin_sum
+            )
+
+            output[index] = (
+                (
+                    mark_power
+                    - space_power
+                )
+                / (
+                    mark_power
+                    + space_power
+                    + epsilon
+                )
+            )
+
+    return output
+
+
+def smooth_iir(samples, alpha=0.30):
+    if not samples:
+        return []
+
+    alpha = clamp(
+        alpha,
+        0.001,
+        1.0
+    )
+
+    output = [0.0] * len(samples)
+
+    state = samples[0]
+
+    for index, value in enumerate(samples):
+        state += (
+            alpha
+            * (value - state)
+        )
+
+        output[index] = state
+
+    return output
+
+
+def adaptive_center(
+    samples,
+    alpha=0.002
+):
+    if not samples:
+        return []
+
+    center = samples[0]
+    output = [0.0] * len(samples)
+
+    for index, value in enumerate(samples):
+        center += (
+            alpha
+            * (value - center)
+        )
+
+        output[index] = (
+            value - center
+        )
+
+    return output
+
+
+# =========================
+# Clock recovery
+# =========================
+
+def clock_recover_pll(
+    discriminator,
+    sample_rate,
+    baud,
+    initial_phase=0.0,
+    phase_gain=0.22,
+    rate_gain=0.0008
+):
+    if len(discriminator) < 4:
+        return [], {}
+
+    nominal_increment = (
+        float(baud)
+        / float(sample_rate)
+    )
+
+    increment = nominal_increment
+
+    minimum_increment = (
+        nominal_increment * 0.94
+    )
+
+    maximum_increment = (
+        nominal_increment * 1.06
+    )
+
+    phase = initial_phase % 1.0
+
+    previous_tone = (
+        1
+        if discriminator[0] >= 0.0
+        else 0
+    )
+
+    symbols = []
+    sample_positions = []
+
+    phase_error_sum = 0.0
+    transition_count = 0
+
+    for index in range(
+        1,
+        len(discriminator)
+    ):
+        tone = (
+            1
+            if discriminator[index] >= 0.0
+            else 0
+        )
+
+        if tone != previous_tone:
+            error = phase
+
+            if error > 0.5:
+                error -= 1.0
+
+            phase -= phase_gain * error
+            increment -= rate_gain * error
+
+            increment = clamp(
+                increment,
+                minimum_increment,
+                maximum_increment
+            )
+
+            phase %= 1.0
+
+            phase_error_sum += abs(error)
+            transition_count += 1
+
+            previous_tone = tone
+
+        previous_phase = phase
+
+        phase += increment
+
+        wrapped = False
+
+        if phase >= 1.0:
+            phase -= 1.0
+            wrapped = True
+
+        if not wrapped:
+            crossed_center = (
+                previous_phase < 0.5
+                <= phase
+            )
+        else:
+            crossed_center = (
+                previous_phase < 0.5
+                or phase >= 0.5
+            )
+
+        if not crossed_center:
+            continue
+
+        if not wrapped:
+            phase_distance = (
+                phase - previous_phase
+            )
+
+            target_distance = (
+                0.5 - previous_phase
+            )
+        else:
+            phase_distance = (
+                1.0
+                - previous_phase
+                + phase
+            )
+
+            if previous_phase < 0.5:
+                target_distance = (
+                    0.5
+                    - previous_phase
+                )
+            else:
+                target_distance = (
+                    1.0
+                    - previous_phase
+                    + 0.5
+                )
+
+        if phase_distance > 1e-12:
+            fraction = clamp(
+                target_distance
+                / phase_distance,
+                0.0,
+                1.0
+            )
+        else:
+            fraction = 0.0
+
+        sample_position = (
+            index - 1
+        ) + fraction
+
+        soft_value = _interp(
+            discriminator,
+            sample_position
+        )
+
+        symbols.append(
+            1
+            if soft_value >= 0.0
+            else 0
+        )
+
+        sample_positions.append(
+            sample_position
+        )
+
+    recovered_baud = (
+        increment
+        * sample_rate
+    )
+
+    stats = {
+        'symbols': len(symbols),
+        'transitions': transition_count,
+        'mean_phase_error': (
+            phase_error_sum
+            / transition_count
+            if transition_count
+            else 1.0
+        ),
+        'recovered_baud': recovered_baud,
+        'sample_positions': sample_positions,
+    }
+
+    return symbols, stats
+
+
+def nrzi_decode(
+    symbols,
+    polarity=0
+):
+    if len(symbols) < 2:
+        return []
+
+    bits = []
+
+    previous_symbol = symbols[0]
+
+    for current_symbol in symbols[1:]:
+        bit = (
+            1
+            if current_symbol == previous_symbol
+            else 0
+        )
+
+        bit ^= polarity
+
+        bits.append(bit)
+
+        previous_symbol = current_symbol
+
+    return bits
+
+
+# =========================
+# HDLC extraction
+# =========================
+
+def hdlc_destuff(raw_bits):
+    output = []
+
+    consecutive_ones = 0
+    index = 0
+
+    while index < len(raw_bits):
+        bit = raw_bits[index]
+
+        if bit == 1:
+            output.append(1)
+            consecutive_ones += 1
+
+            if consecutive_ones >= 6:
+                return None
+
+        else:
+            if consecutive_ones == 5:
+                consecutive_ones = 0
+                index += 1
+                continue
+
+            output.append(0)
+            consecutive_ones = 0
+
+        index += 1
+
+    return output
+
+
+def extract_hdlc_frames(
+    bits,
+    max_frame_bytes=600
+):
+    flag_bits = bits_lsb(FLAG)
+
+    flag_positions = []
+
+    shift_register = deque(
+        maxlen=8
+    )
+
+    for index, bit in enumerate(bits):
+        shift_register.append(bit)
+
+        if (
+            len(shift_register) == 8
+            and list(shift_register)
+            == flag_bits
+        ):
+            flag_positions.append(
+                index - 7
+            )
+
+    frames = []
+
+    for left, right in zip(
+        flag_positions,
+        flag_positions[1:]
+    ):
+        raw_frame_bits = bits[
+            left + 8:right
+        ]
+
+        if len(raw_frame_bits) < 8:
+            continue
+
+        if (
+            len(raw_frame_bits)
+            > max_frame_bytes * 10
+        ):
+            continue
+
+        destuffed_bits = hdlc_destuff(
+            raw_frame_bits
+        )
+
+        if not destuffed_bits:
+            continue
+
+        if len(destuffed_bits) % 8 != 0:
+            continue
+
+        frame = bits_to_bytes(
+            destuffed_bits
+        )
+
+        if (
+            16
+            <= len(frame)
+            <= max_frame_bytes
+        ):
+            frames.append(frame)
+
+    return frames, len(flag_positions)
+
+
+def packet_signature(packet):
+    addresses, info, crc_ok = packet
+
+    return (
+        tuple(addresses),
+        bytes(info),
+        bool(crc_ok)
+    )
+
+
+# =========================
+# AFSK decoder
+# =========================
+
+class AFSKDecoder:
+    def __init__(
+        self,
+        baud=1200,
+        mark=1200,
+        space=2200,
+        sample_rate=TARGET_SR,
+        nrzi_polarity=0,
+        roll_sec=None
+    ):
+        self.baud = int(
+            max(
+                1,
+                min(
+                    9600,
+                    baud
+                )
+            )
+        )
+
+        self.mark = float(mark)
+        self.space = float(space)
+
+        self.sample_rate = int(
+            sample_rate
+        )
+
+        self.nrzi_polarity = (
+            int(nrzi_polarity) & 1
+        )
+
+        if roll_sec is None:
+            self.buf = []
+        else:
+            self.buf = deque(
+                maxlen=int(
+                    float(roll_sec)
+                    * self.sample_rate
+                )
+            )
+
+        self.last_stats = {}
+
+    def push(
+        self,
+        samples,
+        source_sample_rate
+    ):
+        if not samples:
+            return
+
+        processed = resample_linear(
+            samples,
+            source_sample_rate,
+            self.sample_rate
+        )
+
+        processed = dc_block(
+            processed,
+            coefficient=0.997
+        )
+
+        processed = rms_normalize(
+            processed,
+            target=0.30
+        )
+
+        processed = soft_limit(
+            processed,
+            gain=1.35
+        )
+
+        self.buf.extend(processed)
+
+    def _make_discriminator(
+        self,
+        samples
+    ):
+        samples_per_bit = (
+            self.sample_rate
+            / float(self.baud)
+        )
+
+        window_samples = max(
+            4,
+            int(
+                round(
+                    samples_per_bit
+                )
+            )
+        )
+
+        discriminator = (
+            quadrature_discriminator(
+                samples,
+                self.sample_rate,
+                self.mark,
+                self.space,
+                window_samples
+            )
+        )
+
+        discriminator = smooth_iir(
+            discriminator,
+            alpha=0.38
+        )
+
+        discriminator = adaptive_center(
+            discriminator,
+            alpha=0.0015
+        )
+
+        return discriminator
+
+    def _decode_hypothesis(
+        self,
+        discriminator,
+        initial_phase,
+        phase_gain,
+        rate_gain,
+        polarity
+    ):
+        symbols, pll_stats = (
+            clock_recover_pll(
+                discriminator,
+                self.sample_rate,
+                self.baud,
+                initial_phase=initial_phase,
+                phase_gain=phase_gain,
+                rate_gain=rate_gain
+            )
+        )
+
+        bits = nrzi_decode(
+            symbols,
+            polarity
+        )
+
+        raw_frames, flag_count = (
+            extract_hdlc_frames(bits)
+        )
+
+        packets = []
+
+        crc_ok_count = 0
+        plausible_count = 0
+
+        for raw_frame in raw_frames:
+            packet = parse_ax25(
+                raw_frame
+            )
+
+            if packet is None:
+                continue
+
+            addresses, info, crc_ok = (
+                packet
+            )
+
+            if len(addresses) < 2:
+                continue
+
+            if crc_ok:
+                crc_ok_count += 1
+
+            if is_printable_payload(info):
+                plausible_count += 1
+
+            packets.append(packet)
+
+        score = 0
+
+        score += (
+            crc_ok_count * 10000
+        )
+
+        score += (
+            plausible_count * 100
+        )
+
+        score += (
+            len(packets) * 25
+        )
+
+        score += min(
+            flag_count,
+            100
+        )
+
+        mean_phase_error = (
+            pll_stats.get(
+                'mean_phase_error',
+                1.0
+            )
+        )
+
+        score -= int(
+            mean_phase_error * 20.0
+        )
+
+        stats = dict(pll_stats)
+
+        stats.update({
+            'flag_count': flag_count,
+            'raw_frames': len(raw_frames),
+            'parsed_packets': len(packets),
+            'crc_ok': crc_ok_count,
+            'plausible': plausible_count,
+            'score': score,
+            'initial_phase': initial_phase,
+            'phase_gain': phase_gain,
+            'rate_gain': rate_gain,
+            'polarity': polarity,
+        })
+
+        return packets, stats
+
+    def decode(self):
+        samples = list(self.buf)
+
+        minimum_samples = int(
+            self.sample_rate * 0.15
+        )
+
+        if len(samples) < minimum_samples:
+            self.last_stats = {
+                'error': 'not enough audio',
+                'audio_samples': len(samples),
+                'audio_seconds': (
+                    len(samples)
+                    / float(self.sample_rate)
+                ),
+            }
+
+            return []
+
+        discriminator = (
+            self._make_discriminator(
+                samples
+            )
+        )
+
+        if (
+            len(discriminator)
+            < minimum_samples
+        ):
+            self.last_stats = {
+                'error': (
+                    'discriminator too short'
+                ),
+                'audio_samples': len(samples),
+                'audio_seconds': (
+                    len(samples)
+                    / float(self.sample_rate)
+                ),
+            }
+
+            return []
+
+        samples_per_bit = (
+            self.sample_rate
+            / float(self.baud)
+        )
+
+        phase_hypotheses = [
+            index / 8.0
+            for index in range(8)
+        ]
+
+        loop_hypotheses = [
+            (0.12, 0.00025),
+            (0.20, 0.00060),
+            (0.28, 0.00120),
+        ]
+
+        best_packets = []
+        best_stats = None
+        best_score = -(10 ** 18)
+
+        all_crc_packets = {}
+
+        for initial_phase in phase_hypotheses:
+            for (
+                phase_gain,
+                rate_gain
+            ) in loop_hypotheses:
+                for polarity in (
+                    self.nrzi_polarity,
+                    self.nrzi_polarity ^ 1
+                ):
+                    packets, stats = (
+                        self._decode_hypothesis(
+                            discriminator,
+                            initial_phase,
+                            phase_gain,
+                            rate_gain,
+                            polarity
+                        )
+                    )
+
+                    for packet in packets:
+                        if packet[2]:
+                            signature = (
+                                packet_signature(packet)
+                            )
+
+                            all_crc_packets[
+                                signature
+                            ] = packet
+
+                    if (
+                        stats['score']
+                        > best_score
+                    ):
+                        best_score = (
+                            stats['score']
+                        )
+
+                        best_packets = packets
+                        best_stats = stats
+
+        if all_crc_packets:
+            result = list(
+                all_crc_packets.values()
+            )
+        else:
+            result = best_packets
+
+        unique_packets = {}
+
+        for packet in result:
+            unique_packets[
+                packet_signature(packet)
+            ] = packet
+
+        result = list(
+            unique_packets.values()
+        )
+
+        result.sort(
+            key=lambda packet: (
+                not packet[2],
+                not is_printable_payload(
+                    packet[1]
+                ),
+                len(packet[1])
+            )
+        )
+
+        self.last_stats = (
+            best_stats or {}
+        )
+
+        self.last_stats[
+            'samples_per_bit'
+        ] = samples_per_bit
+
+        self.last_stats[
+            'audio_samples'
+        ] = len(samples)
+
+        self.last_stats[
+            'audio_seconds'
+        ] = (
+            len(samples)
+            / float(self.sample_rate)
+        )
+
+        self.last_stats[
+            'returned_packets'
+        ] = len(result)
+
+        return result
+
+
+# =========================
+# Direct internal loopback
+# =========================
+
+def decode_audio_samples(
+    audio,
+    sample_rate,
+    baud,
+    mark,
+    space
+):
+    """
+    Feed generated PCM directly into the decoder.
+
+    This bypasses the microphone, speaker, receiver, and audio routing.
+    """
+
+    normalized_samples = [
+        float(sample) / 32768.0
+        for sample in audio
+    ]
+
+    decoder = AFSKDecoder(
+        baud=baud,
+        mark=mark,
+        space=space,
+        sample_rate=TARGET_SR,
+        nrzi_polarity=NRZI_POLARITY,
+        roll_sec=None
+    )
+
+    decoder.push(
+        normalized_samples,
+        sample_rate
+    )
+
+    packets = decoder.decode()
+
+    return packets, decoder.last_stats
+
+
+# =========================
+# WAV helpers
+# =========================
+
+def read_wav_all(filename):
+    with wave.open(filename, 'rb') as wav_file:
+        sample_rate = (
+            wav_file.getframerate()
+        )
+
+        channel_count = (
+            wav_file.getnchannels()
+        )
+
+        sample_width = (
+            wav_file.getsampwidth()
+        )
+
+        if sample_width != 2:
+            raise ValueError(
+                'Expected 16-bit WAV'
+            )
+
+        frame_count = (
+            wav_file.getnframes()
+        )
+
+        raw_audio = wav_file.readframes(
+            frame_count
+        )
+
+    samples = []
+
+    frame_size = (
+        2 * channel_count
+    )
+
+    for index in range(
+        0,
+        len(raw_audio),
+        frame_size
+    ):
+        sample = int.from_bytes(
+            raw_audio[index:index + 2],
+            'little',
+            signed=True
+        )
+
+        samples.append(
+            sample / 32768.0
+        )
+
+    return samples, sample_rate
+
+
+def wait_for_file_stable(
+    filename,
+    stable_sec=0.5,
+    timeout=5.0
+):
+    deadline = time.time() + timeout
+
+    last_size = -1
+    stable_for = 0.0
+
+    while time.time() < deadline:
+        if not os.path.exists(filename):
+            time.sleep(0.05)
+            continue
+
+        size = os.path.getsize(
+            filename
+        )
+
+        if (
+            size == last_size
+            and size > 44
+        ):
+            stable_for += 0.05
+
+            if stable_for >= stable_sec:
+                return True
+        else:
+            stable_for = 0.0
+            last_size = size
+
+        time.sleep(0.05)
+
+    return False
+
+
+# =========================
+# TX View
+# =========================
+
+class TXView(ui.View):
+    def __init__(self):
+        super().__init__()
+
+        self.bg_color = '#101214'
+
+        self.title = ui.Label(
+            text='Custom Packet TX',
+            text_color='white',
+            font=(
+                'Helvetica-Bold',
+                20
+            )
+        )
+
+        self.add_subview(
+            self.title
+        )
+
+        self.src = ui.TextField(
+            text='N0CALL-1',
+            placeholder='Source (MYCALL-SSID)',
+            autocorrection_type=False,
+            spellchecking_type=False,
+            text_color='black',
+            bg_color='white'
+        )
+
+        self.dest = ui.TextField(
+            text='APRS',
+            placeholder='Destination',
+            autocorrection_type=False,
+            spellchecking_type=False,
+            text_color='black',
+            bg_color='white'
+        )
+
+        self.path = ui.TextField(
+            text='WIDE1-1,WIDE2-1',
+            placeholder='Path CSV',
+            autocorrection_type=False,
+            spellchecking_type=False,
+            text_color='black',
+            bg_color='white'
+        )
+
+        self.comment = ui.TextField(
+            text=(
+                ''
+            ),
+            placeholder='Comment',
+            autocorrection_type=True,
+            spellchecking_type=True,
+            text_color='black',
+            bg_color='white'
+        )
+
+        self.baud = ui.TextField(
+            text='1200',
+            placeholder='Baud',
+            autocorrection_type=False,
+            spellchecking_type=False,
+            keyboard_type=ui.KEYBOARD_NUMBERS,
+            text_color='black',
+            bg_color='white'
+        )
+
+        self.mark = ui.TextField(
+            text='1200',
+            placeholder='Mark Hz',
+            autocorrection_type=False,
+            spellchecking_type=False,
+            keyboard_type=ui.KEYBOARD_NUMBERS,
+            text_color='black',
+            bg_color='white'
+        )
+
+        self.space = ui.TextField(
+            text='2200',
+            placeholder='Space Hz',
+            autocorrection_type=False,
+            spellchecking_type=False,
+            keyboard_type=ui.KEYBOARD_NUMBERS,
+            text_color='black',
+            bg_color='white'
+        )
+
+        for control in (
+            self.src,
+            self.dest,
+            self.path,
+            self.comment,
+            self.baud,
+            self.mark,
+            self.space
+        ):
+            control.border_width = 0
+            control.corner_radius = 8
+            control.font = (
+                'Menlo',
+                14
+            )
+
+            self.add_subview(control)
+
+        self.use_gps = ui.Switch(
+            value=HAS_LOCATION
+        )
+
+        self.gps_label = ui.Label(
+            text=(
+                'Use GPS ({})'.format(
+                    'available'
+                    if HAS_LOCATION
+                    else 'unavailable'
+                )
+            ),
+            text_color='white',
+            font=(
+                'Menlo',
+                12
+            )
+        )
+
+        self.add_subview(
+            self.use_gps
+        )
+
+        self.add_subview(
+            self.gps_label
+        )
+
+        self.manual_lat = ui.TextField(
+            text='37.7749',
+            placeholder='Manual latitude',
+            autocorrection_type=False,
+            spellchecking_type=False,
+            keyboard_type=ui.KEYBOARD_DECIMAL_PAD,
+            text_color='black',
+            bg_color='white'
+        )
+
+        self.manual_lon = ui.TextField(
+            text='-122.4194',
+            placeholder='Manual longitude',
+            autocorrection_type=False,
+            spellchecking_type=False,
+            keyboard_type=ui.KEYBOARD_DECIMAL_PAD,
+            text_color='black',
+            bg_color='white'
+        )
+
+        for control in (
+            self.manual_lat,
+            self.manual_lon
+        ):
+            control.border_width = 0
+            control.corner_radius = 8
+            control.font = (
+                'Menlo',
+                14
+            )
+
+            self.add_subview(control)
+
+        self.loopback_switch = ui.Switch(
+            value=True
+        )
+
+        self.loopback_label = ui.Label(
+            text='Instant internal self-decode',
+            text_color='white',
+            font=(
+                'Menlo',
+                12
+            )
+        )
+
+        self.add_subview(
+            self.loopback_switch
+        )
+
+        self.add_subview(
+            self.loopback_label
+        )
+
+        self.play_btn = ui.Button(
+            title='Generate + Play',
+            font=(
+                'Helvetica-Bold',
+                18
+            )
+        )
+
+        self.play_btn.action = (
+            self.on_play
+        )
+
+        self.play_btn.bg_color = (
+            '#2b6cff'
+        )
+
+        self.play_btn.tint_color = (
+            'white'
+        )
+
+        self.play_btn.corner_radius = 10
+
+        self.add_subview(
+            self.play_btn
+        )
+
+        self.status = ui.Label(
+            text='Idle',
+            text_color='white',
+            font=(
+                'Menlo',
+                12
+            )
+        )
+
+        self.add_subview(
+            self.status
+        )
+
+        self.last_info = ui.TextView(
+            editable=False,
+            font=(
+                'Menlo',
+                12
+            )
+        )
+
+        self.last_info.text_color = (
+            'lime'
+        )
+
+        self.last_info.bg_color = (
+            '#0b0d10'
+        )
+
+        self.last_info.corner_radius = 10
+
+        self.add_subview(
+            self.last_info
+        )
+
+    def layout(self):
+        padding = 12
+        y = 10
+
+        width = (
+            self.width
+            - 2 * padding
+        )
+
+        field_height = 34
+
+        self.title.frame = (
+            padding,
+            y,
+            width,
+            28
+        )
+
+        y += 36
+
+        self.src.frame = (
+            padding,
+            y,
+            width,
+            field_height
+        )
+
+        y += field_height + 8
+
+        self.dest.frame = (
+            padding,
+            y,
+            width,
+            field_height
+        )
+
+        y += field_height + 8
+
+        self.path.frame = (
+            padding,
+            y,
+            width,
+            field_height
+        )
+
+        y += field_height + 8
+
+        self.comment.frame = (
+            padding,
+            y,
+            width,
+            field_height
+        )
+
+        y += field_height + 8
+
+        third_width = (
+            width - 16
+        ) / 3.0
+
+        self.baud.frame = (
+            padding,
+            y,
+            third_width,
+            field_height
+        )
+
+        self.mark.frame = (
+            padding
+            + third_width
+            + 8,
+            y,
+            third_width,
+            field_height
+        )
+
+        self.space.frame = (
+            padding
+            + 2 * (
+                third_width + 8
+            ),
+            y,
+            third_width,
+            field_height
+        )
+
+        y += field_height + 10
+
+        self.use_gps.frame = (
+            padding,
+            y,
+            60,
+            32
+        )
+
+        self.gps_label.frame = (
+            padding + 70,
+            y + 5,
+            width - 70,
+            24
+        )
+
+        y += 40
+
+        half_width = (
+            width - 8
+        ) / 2.0
+
+        self.manual_lat.frame = (
+            padding,
+            y,
+            half_width,
+            field_height
+        )
+
+        self.manual_lon.frame = (
+            padding
+            + half_width
+            + 8,
+            y,
+            half_width,
+            field_height
+        )
+
+        y += field_height + 12
+
+        self.loopback_switch.frame = (
+            padding,
+            y,
+            60,
+            32
+        )
+
+        self.loopback_label.frame = (
+            padding + 70,
+            y + 5,
+            width - 70,
+            24
+        )
+
+        y += 40
+
+        self.play_btn.frame = (
+            padding,
+            y,
+            width,
+            44
+        )
+
+        y += 52
+
+        self.status.frame = (
+            padding,
+            y,
+            width,
+            20
+        )
+
+        y += 28
+
+        self.last_info.frame = (
+            padding,
+            y,
+            width,
+            max(
+                50,
+                self.height
+                - y
+                - padding
+            )
+        )
+
+    def set_status(self, text):
+        self.status.text = text
+
+    def on_play(self, sender):
+        try:
+            self.set_status(
+                'Building packet...'
+            )
+
+            source = (
+                self.src.text.strip()
+                or 'N0CALL-1'
+            )
+
+            destination = (
+                self.dest.text.strip()
+                or 'APRS'
+            )
+
+            path = [
+                item.strip()
+                for item in (
+                    self.path.text
+                    or ''
+                ).split(',')
+                if item.strip()
+            ]
+
+            comment = (
+                self.comment.text
+                or ''
+            ).strip()
+
+            info = comment
+            
+            baud = clamp(
+                safe_int(
+                    self.baud.text,
+                    9600
+                ),
+                1,
+                9600
+            )
+
+            mark = safe_float(
+                self.mark.text,
+                1200.0
+            )
+
+            space = safe_float(
+                self.space.text,
+                2200.0
+            )
+
+            frame = ax25_frame(
+                source,
+                destination,
+                path,
+                info
+            )
+
+            audio = afsk_encode(
+                frame,
+                baud=baud,
+                mark=mark,
+                space=space,
+                sample_rate=TX_SAMPLE_RATE,
+                nrzi_polarity=NRZI_POLARITY
+            )
+
+            loopback_text = ''
+
+            if self.loopback_switch.value:
+                self.set_status(
+                    'Internal decode...'
+                )
+
+                packets, stats = (
+                    decode_audio_samples(
+                        audio,
+                        TX_SAMPLE_RATE,
+                        baud,
+                        mark,
+                        space
+                    )
+                )
+
+                loopback_lines = [
+                    '',
+                    'Instant internal decode:',
+                    (
+                        'audio={:.3f}s '
+                        'symbols={} '
+                        'flags={} '
+                        'frames={} '
+                        'crc={}'
+                    ).format(
+                        stats.get(
+                            'audio_seconds',
+                            0.0
+                        ),
+                        stats.get(
+                            'symbols',
+                            0
+                        ),
+                        stats.get(
+                            'flag_count',
+                            0
+                        ),
+                        stats.get(
+                            'parsed_packets',
+                            0
+                        ),
+                        stats.get(
+                            'crc_ok',
+                            0
+                        )
+                    ),
+                    (
+                        'requested={:.2f} '
+                        'recovered={:.2f} '
+                        'phase_error={:.4f}'
+                    ).format(
+                        float(baud),
+                        stats.get(
+                            'recovered_baud',
+                            0.0
+                        ),
+                        stats.get(
+                            'mean_phase_error',
+                            0.0
+                        )
+                    )
+                ]
+
+                if packets:
+                    for (
+                        addresses,
+                        decoded_info,
+                        crc_ok
+                    ) in packets:
+                        decoded_destination = (
+                            addresses[0]
+                            if len(addresses) > 0
+                            else '?'
+                        )
+
+                        decoded_source = (
+                            addresses[1]
+                            if len(addresses) > 1
+                            else '?'
+                        )
+
+                        decoded_path = (
+                            ','.join(
+                                addresses[2:]
+                            )
+                            if len(addresses) > 2
+                            else '-'
+                        )
+
+                        loopback_lines.append(
+                            (
+                                '{} > {} via {} '
+                                'CRC:{}'
+                            ).format(
+                                decoded_source,
+                                decoded_destination,
+                                decoded_path,
+                                (
+                                    'OK'
+                                    if crc_ok
+                                    else 'BAD'
+                                )
+                            )
+                        )
+
+                        loopback_lines.append(
+                            decoded_info.decode(
+                                'ascii',
+                                'replace'
+                            )
+                        )
+                else:
+                    error_text = stats.get(
+                        'error'
+                    )
+
+                    if error_text:
+                        loopback_lines.append(
+                            'Decoder error: {}'.format(
+                                error_text
+                            )
+                        )
+                    else:
+                        loopback_lines.append(
+                            'No packet decoded.'
+                        )
+
+                loopback_text = '\n'.join(
+                    loopback_lines
+                )
+
+            filename = (
+                'pkt_{}.wav'.format(
+                    datetime.now().strftime(
+                        '%H%M%S'
+                    )
+                )
+            )
+
+            save_to_wav(
+                audio,
+                filename,
+                TX_SAMPLE_RATE
+            )
+
+            play_audio(filename)
+
+            self.last_info.text = (
+                'Built info:\n'
+                '{}\n\n'
+                'Baud/Mark/Space: '
+                '{} / {:.1f} / {:.1f}\n'
+                'Frame bytes: {}\n'
+                'Audio samples: {}\n'
+                'WAV: {}\n'
+                '{}\n'
+            ).format(
+                info,
+                baud,
+                mark,
+                space,
+                len(frame),
+                len(audio),
+                filename,
+                loopback_text
+            )
+
+            self.set_status(
+                'Played.'
+            )
+
+        except Exception as error:
+            self.set_status(
+                'Error: {!r}'.format(
+                    error
+                )
+            )
+
+
+# =========================
+# RX View
+# =========================
+
+class RXView(ui.View):
+    def __init__(self):
+        super().__init__()
+
+        self.bg_color = 'black'
+
+        self.title = ui.Label(
+            text='Custom Packet RX',
+            text_color='white',
+            font=(
+                'Helvetica-Bold',
+                20
+            )
+        )
+
+        self.add_subview(
+            self.title
+        )
+
+        self.baud = ui.TextField(
+            text='1200',
+            placeholder='Baud',
+            autocorrection_type=False,
+            spellchecking_type=False,
+            keyboard_type=ui.KEYBOARD_NUMBERS,
+            text_color='black',
+            bg_color='white'
+        )
+
+        self.mark = ui.TextField(
+            text='1200',
+            placeholder='Mark Hz',
+            autocorrection_type=False,
+            spellchecking_type=False,
+            keyboard_type=ui.KEYBOARD_NUMBERS,
+            text_color='black',
+            bg_color='white'
+        )
+
+        self.space = ui.TextField(
+            text='2200',
+            placeholder='Space Hz',
+            autocorrection_type=False,
+            spellchecking_type=False,
+            keyboard_type=ui.KEYBOARD_NUMBERS,
+            text_color='black',
+            bg_color='white'
+        )
+
+        for control in (
+            self.baud,
+            self.mark,
+            self.space
+        ):
+            control.border_width = 0
+            control.corner_radius = 8
+            control.font = (
+                'Menlo',
+                14
+            )
+
+            self.add_subview(control)
+
+        self.start_btn = ui.Button(
+            title='Start RX',
+            action=self.start_rx,
+            font=(
+                'Helvetica',
+                20
+            )
+        )
+
+        self.stop_btn = ui.Button(
+            title='Stop + Decode',
+            action=self.stop_rx,
+            font=(
+                'Helvetica',
+                20
+            )
+        )
+
+        self.stop_btn.enabled = False
+
+        self.start_btn.bg_color = (
+            '#2b6cff'
+        )
+
+        self.start_btn.tint_color = (
+            'white'
+        )
+
+        self.start_btn.corner_radius = 10
+
+        self.stop_btn.bg_color = (
+            '#ff3b30'
+        )
+
+        self.stop_btn.tint_color = (
+            'white'
+        )
+
+        self.stop_btn.corner_radius = 10
+
+        self.add_subview(
+            self.start_btn
+        )
+
+        self.add_subview(
+            self.stop_btn
+        )
+
+        self.status = ui.Label(
+            text='Idle',
+            text_color='white',
+            font=(
+                'Menlo',
+                12
+            )
+        )
+
+        self.add_subview(
+            self.status
+        )
+
+        self.out = ui.TextView(
+            font=(
+                'Menlo',
+                12
+            ),
+            editable=False
+        )
+
+        self.out.text_color = 'lime'
+        self.out.bg_color = 'black'
+
+        self.add_subview(
+            self.out
+        )
+
+        self._recorder = None
+        self._filename = None
+        self._decoding = False
+
+    def layout(self):
+        padding = 12
+        y = 10
+
+        width = (
+            self.width
+            - 2 * padding
+        )
+
+        field_height = 34
+
+        self.title.frame = (
+            padding,
+            y,
+            width,
+            28
+        )
+
+        y += 38
+
+        third_width = (
+            width - 16
+        ) / 3.0
+
+        self.baud.frame = (
+            padding,
+            y,
+            third_width,
+            field_height
+        )
+
+        self.mark.frame = (
+            padding
+            + third_width
+            + 8,
+            y,
+            third_width,
+            field_height
+        )
+
+        self.space.frame = (
+            padding
+            + 2 * (
+                third_width + 8
+            ),
+            y,
+            third_width,
+            field_height
+        )
+
+        y += field_height + 10
+
+        button_width = (
+            width - 10
+        ) / 2.0
+
+        self.start_btn.frame = (
+            padding,
+            y,
+            button_width,
+            44
+        )
+
+        self.stop_btn.frame = (
+            padding
+            + button_width
+            + 10,
+            y,
+            button_width,
+            44
+        )
+
+        y += 54
+
+        self.status.frame = (
+            padding,
+            y,
+            width,
+            20
+        )
+
+        y += 28
+
+        self.out.frame = (
+            padding,
+            y,
+            width,
+            max(
+                50,
+                self.height
+                - y
+                - padding
+            )
+        )
+
+    def set_status(self, text):
+        self.status.text = text
+
+    def _append_lines_mainthread(
+        self,
+        lines
+    ):
+        text = (
+            self.out.text
+            + '\n'.join(lines)
+            + '\n'
+        )
+
+        if len(text) > MAX_LOG_CHARS:
+            text = text[
+                -MAX_LOG_CHARS:
+            ]
+
+        self.out.text = text
+
+        self.out.content_offset = (
+            0,
+            max(
+                0,
+                self.out.content_size[1]
+                - self.out.height
+            )
+        )
+
+    def start_rx(self, sender):
+        if (
+            self._recorder
+            or self._decoding
+        ):
+            return
+
+        self.out.text = ''
+
+        self._filename = (
+            'rx_capture_{}.wav'.format(
+                datetime.now().strftime(
+                    '%Y%m%d_%H%M%S'
+                )
+            )
+        )
+
+        self._recorder = sound.Recorder(
+            self._filename
+        )
+
+        try:
+            self._recorder.record(
+                MAX_RECORD_SECONDS
+            )
+        except Exception:
+            self._recorder.record()
+
+        self.start_btn.enabled = False
+        self.stop_btn.enabled = True
+
+        self.set_status(
+            'Recording...'
+        )
+
+    def stop_rx(self, sender):
+        if (
+            not self._recorder
+            or self._decoding
+        ):
+            return
+
+        baud = clamp(
+            safe_int(
+                self.baud.text,
+                9600
+            ),
+            1,
+            9600
+        )
+
+        mark = safe_float(
+            self.mark.text,
+            1200.0
+        )
+
+        space = safe_float(
+            self.space.text,
+            2200.0
+        )
+
+        try:
+            self._recorder.stop()
+        except Exception:
+            pass
+
+        self._recorder = None
+        self._decoding = True
+
+        self.stop_btn.enabled = False
+
+        self.set_status(
+            'Finalizing WAV...'
+        )
+
+        thread = threading.Thread(
+            target=self._decode_worker,
+            args=(
+                self._filename,
+                baud,
+                mark,
+                space
+            )
+        )
+
+        thread.daemon = True
+        thread.start()
+
+    def _decode_worker(
+        self,
+        filename,
+        baud,
+        mark,
+        space
+    ):
+        lines = []
+
+        try:
+            wait_for_file_stable(
+                filename,
+                stable_sec=0.5,
+                timeout=(
+                    FINALIZE_WAIT_SEC
+                    + 2.0
+                )
+            )
+
+            if (
+                not os.path.exists(filename)
+                or os.path.getsize(filename)
+                <= 44
+            ):
+                lines.append(
+                    '[warn] no readable audio captured'
+                )
+            else:
+                samples, sample_rate = (
+                    read_wav_all(filename)
+                )
+
+                decoder = AFSKDecoder(
+                    baud=baud,
+                    mark=mark,
+                    space=space,
+                    sample_rate=TARGET_SR,
+                    nrzi_polarity=NRZI_POLARITY,
+                    roll_sec=None
+                )
+
+                decoder.push(
+                    samples,
+                    sample_rate
+                )
+
+                packets = decoder.decode()
+                stats = decoder.last_stats
+
+                lines.append(
+                    (
+                        '[modem] '
+                        'audio={:.2f}s '
+                        'symbols={} '
+                        'flags={} '
+                        'frames={} '
+                        'crc={}'
+                    ).format(
+                        stats.get(
+                            'audio_seconds',
+                            0.0
+                        ),
+                        stats.get(
+                            'symbols',
+                            0
+                        ),
+                        stats.get(
+                            'flag_count',
+                            0
+                        ),
+                        stats.get(
+                            'parsed_packets',
+                            0
+                        ),
+                        stats.get(
+                            'crc_ok',
+                            0
+                        )
+                    )
+                )
+
+                lines.append(
+                    (
+                        '[clock] '
+                        'requested={:.2f} '
+                        'recovered={:.2f} '
+                        'error={:.4f}'
+                    ).format(
+                        float(baud),
+                        stats.get(
+                            'recovered_baud',
+                            0.0
+                        ),
+                        stats.get(
+                            'mean_phase_error',
+                            0.0
+                        )
+                    )
+                )
+
+                if stats.get('error'):
+                    lines.append(
+                        '[decoder] {}'.format(
+                            stats['error']
+                        )
+                    )
+
+                lines.append('')
+
+                displayed_packet = False
+
+                for (
+                    addresses,
+                    info,
+                    crc_ok
+                ) in packets:
+                    if (
+                        SHOW_ONLY_CRC_OK
+                        and not crc_ok
+                    ):
+                        continue
+
+                    displayed_packet = True
+
+                    destination = (
+                        addresses[0]
+                        if len(addresses) > 0
+                        else '?'
+                    )
+
+                    source = (
+                        addresses[1]
+                        if len(addresses) > 1
+                        else '?'
+                    )
+
+                    path = (
+                        ','.join(
+                            addresses[2:]
+                        )
+                        if len(addresses) > 2
+                        else '-'
+                    )
+
+                    lines.append(
+                        (
+                            '{} > {} via {} '
+                            'CRC:{}'
+                        ).format(
+                            source,
+                            destination,
+                            path,
+                            (
+                                'OK'
+                                if crc_ok
+                                else 'BAD'
+                            )
+                        )
+                    )
+
+                    lines.append(
+                        info.decode(
+                            'ascii',
+                            'replace'
+                        )
+                    )
+
+                    lines.append('')
+
+                if not displayed_packet:
+                    lines.append(
+                        '[decode] no frames found'
+                    )
+
+        except Exception as error:
+            lines.append(
+                '[decode error] {!r}'.format(
+                    error
+                )
+            )
+
+        def finish():
+            self._append_lines_mainthread(
+                lines
+            )
+
+            self._decoding = False
+
+            self.start_btn.enabled = True
+            self.stop_btn.enabled = False
+
+            self.set_status(
+                'Done.'
+            )
+
+        run_ui(finish)
+
+
+# =========================
+# App container
+# =========================
+
+class App(ui.View):
+    def __init__(self):
+        super().__init__()
+
+        self.name = (
+            'Custom Packet TX/RX'
+        )
+
+        self.bg_color = '#0b0d10'
+
+        self.segmented_control = (
+            ui.SegmentedControl(
+                segments=[
+                    'TX',
+                    'RX'
+                ]
+            )
+        )
+
+        self.segmented_control.selected_index = 0
+
+        self.segmented_control.action = (
+            self.on_tab
+        )
+
+        self.add_subview(
+            self.segmented_control
+        )
+
+        self.tx_view = TXView()
+        self.rx_view = RXView()
+
+        self.add_subview(
+            self.tx_view
+        )
+
+        self.add_subview(
+            self.rx_view
+        )
+
+        self.on_tab(
+            self.segmented_control
+        )
+
+    def layout(self):
+        padding = 10
+
+        self.segmented_control.frame = (
+            padding,
+            padding,
+            self.width
+            - 2 * padding,
+            32
+        )
+
+        content_y = (
+            padding + 40
+        )
+
+        content_height = (
+            self.height
+            - content_y
+            - padding
+        )
+
+        self.tx_view.frame = (
+            0,
+            content_y,
+            self.width,
+            content_height
+        )
+
+        self.rx_view.frame = (
+            0,
+            content_y,
+            self.width,
+            content_height
+        )
+
+    def on_tab(self, sender):
+        selected_index = (
+            self.segmented_control
+            .selected_index
+        )
+
+        self.tx_view.hidden = (
+            selected_index != 0
+        )
+
+        self.rx_view.hidden = (
+            selected_index != 1
+        )
+
+
+App().present('fullscreen')
